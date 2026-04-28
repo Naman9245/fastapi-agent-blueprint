@@ -1,0 +1,134 @@
+# Architecture Conventions
+
+> Last synced: 2026-04-26 via /sync-guidelines (added Default Flow cross-link for ADR 045; verified clean against ADR 042/043 baseline)
+> For Absolute Prohibitions, Conversion Patterns, Write DTO criteria, Responsibility Matrix, Error Translation, Optional AI Infra Pattern, Admin Service Contract, and **Default Coding Flow** (process layer, ADR 045), refer to AGENTS.md.
+> This file only contains **structural context** that supplements AGENTS.md for Claude.
+
+## Data Flow (3-Tier Hybrid)
+```
+Default (simple CRUD):
+  Write: Request → Service(BaseService) → Repository → Model → DB
+  Read:  Response ← Service ← Repository ← DTO ← Model
+
+Complex logic:
+  Write: Request → UseCase → Service → Repository → Model → DB
+  Read:  Response ← UseCase ← Service ← Repository ← DTO ← Model
+```
+> UseCase is added only when combining multiple Services or crossing transaction boundaries
+> For detailed Conversion Patterns: refer to the "Conversion Patterns" section in AGENTS.md
+
+## DynamoDB Data Flow
+```
+  Write: Request → Service(BaseDynamoService) → Repository(BaseDynamoRepository) → DynamoModel → DynamoDB
+  Read:  CursorPage[DTO] ← Service ← Repository ← DTO ← DynamoModel
+```
+Key differences from RDB:
+- Composite keys via DynamoKey(partition_key, sort_key?)
+- Cursor-based pagination via CursorPage (not offset-based)
+- BaseDynamoService/BaseDynamoRepository — mirrors RDB counterparts
+
+## S3 Vectors Data Flow
+```
+  Write: Entity → VectorStore(BaseS3VectorStore) → VectorModel → S3 Vectors API
+  Read:  VectorSearchResult[DTO] ← VectorStore ← DTO ← S3 Vectors API response
+```
+Key differences from RDB/DynamoDB:
+- String keys (UUID v4 hex) via `generate_vector_id`
+- Similarity search via VectorQuery (top_k, filters) → VectorSearchResult
+- Subclass must implement `_to_model()` for domain-specific DTO → VectorModel conversion
+- `VectorModelMeta.dimension` auto-derived from `settings.embedding_dimension`
+
+## BaseService Generic Structure
+- `BaseService(Generic[CreateDTO, UpdateDTO, ReturnDTO])` — 3 TypeVars (ADR 011 update, 2026-04-09)
+- `BaseRepositoryProtocol(Generic[ReturnDTO])` / `BaseRepository(Generic[ReturnDTO])` — 1 TypeVar (Repository only calls model_dump, no field-specific access)
+- `BaseDynamoService(Generic[CreateDTO, UpdateDTO, ReturnDTO])` — mirrors BaseService
+- `BaseDynamoRepositoryProtocol(Generic[ReturnDTO])` / `BaseDynamoRepository(Generic[ReturnDTO])` — mirrors BaseRepository
+- `BaseVectorStoreProtocol(Generic[ReturnDTO])` / `BaseS3VectorStore(Generic[ReturnDTO])` — vector store pattern
+- Domain Service example: `UserService(BaseService[CreateUserRequest, UpdateUserRequest, UserDTO])`
+- DO NOT simplify back to 1 TypeVar — this was tried and reverted (see ADR 011 Post-decision Update)
+
+## Broker Selection
+- providers.Selector in CoreContainer: SQS/RabbitMQ/InMemory by BROKER_TYPE env var
+- Task code: `from src._apps.worker.broker import broker` — no conditional logic
+- stg/prod require explicit BROKER_TYPE setting
+
+## Storage Selection
+- Parameter switching in CoreContainer: S3/MinIO by STORAGE_TYPE env var
+- Both use the same `ObjectStorageClient` class — only constructor parameters differ
+- S3: `region_name`, MinIO: `endpoint_url` + dummy `region_name="us-east-1"`
+- No `providers.Selector` needed (same class, different params — contrast with Broker)
+- Settings computed properties (`storage_access_key`, etc.) resolve to S3/MinIO fields based on STORAGE_TYPE
+
+## Embedding (PydanticAI Adapter)
+- Single `PydanticAIEmbeddingAdapter` replaces per-provider clients (ADR 039)
+- No provider-level Selector — PydanticAI handles provider abstraction internally via `model_name` prefix
+- `CoreContainer.embedding_client` wraps the adapter in `providers.Selector`: enabled → real adapter; disabled → `StubEmbedder` for graceful degradation (ADR 042)
+- `EmbeddingConfig` (frozen dataclass VO) is constructed inside the lazy factory — not a standalone container provider
+- Implements `BaseEmbeddingProtocol` (embed_text, embed_batch, dimension)
+- Dimension auto-derived from model name — `settings.embedding_dimension` is single source of truth
+
+## LLM (PydanticAI Agent)
+- `build_llm_model()` factory returns PydanticAI Model object from `LLMConfig`
+- `CoreContainer.llm_model` wraps the factory in `providers.Selector`: enabled → real model; disabled → PydanticAI `TestModel` via `build_stub_llm_model` (or `None` when the `pydantic-ai` extra is uninstalled) (ADR 042)
+- `LLMConfig` (frozen dataclass VO) is constructed inside the lazy factory — not a standalone container provider
+- Domain services inject the Selector-resolved `llm_model` and create `Agent(model=llm_model)` at init; stub propagates transparently
+- Supports OpenAI, Anthropic, Bedrock providers via `model_name` prefix
+- Agents are reusable across requests (create once at service init)
+
+## Structured Logging (#9)
+
+- 파이프라인: `structlog` ProcessorFormatter + `asgi-correlation-id`. JSON(stg/prod) / console(dev/local/quickstart) 자동 전환 (`settings.effective_log_json`)
+- Server: `configure_logging()` → `TrustedHost → CORS → RequestLogMiddleware → CorrelationIdMiddleware` (Starlette는 늦게 `add_middleware`한 것이 외곽이 되므로, 의도적으로 CorrelationId를 가장 마지막에 추가해 요청 최상위에 둠)
+- Worker: `configure_logging()` → `app.add_middlewares(StructlogContextMiddleware())`가 task id / correlation id를 contextvars에 바인딩 (dispatcher가 `with_labels(correlation_id=...)`로 넘긴 값도 자동 lift)
+- Logger 획득 규칙: 모든 애플리케이션 코드는 `structlog.stdlib.get_logger(__name__)` 사용
+  - 기존 `logging.getLogger(__name__)` 호출도 ProcessorFormatter 브리지 덕분에 동일 파이프라인을 타지만, 신규 코드는 structlog API로 통일
+- 민감정보 로깅 금지: `password`, `token`, `access_key`, `secret_key` 등 Response에서 `model_dump(exclude={...})`로 제외하는 필드는 `logger.info(event, password=...)` / `logger.bind(...)` 형태로도 기록 금지
+- SQLAlchemy echo: `DATABASE_ECHO=true`는 `logging.getLogger("sqlalchemy.engine").setLevel(INFO)`로 변환 (engine handler 중복 등록 방지 — 동일 쿼리가 stdlib + structlog 양쪽에서 double-emit 되지 않도록)
+- Env vars: `LOG_LEVEL` (DEBUG/INFO/WARNING/ERROR), `LOG_JSON_FORMAT` (None/True/False — None이면 ENV에서 자동 결정)
+
+## Object Roles
+
+### DTO (Domain DTO)
+- Location: `src/{domain}/domain/dtos/{domain}_dto.py`
+- Role: Carries read results from Repository → Service → Router (full data)
+- **Read-only, single type**: `{Name}DTO` — may include sensitive fields (password, etc.)
+- Create/Update DTO is only created separately when fields differ from Request
+
+### Value Object vs DTO — decision rule
+- **VO (`src/_core/domain/value_objects/`)**: frozen, value-equal, self-validating. Represents a domain concept whose identity IS its fields (e.g. `VectorQuery`, `EmbeddingConfig`, `LLMConfig`, `DynamoKey`, `QueryFilter`).
+  - Prefer `@dataclass(frozen=True)` for config-only VOs (no runtime validation needed).
+  - Use `ValueObject(BaseModel, frozen=True)` base when Pydantic validators are required.
+- **Shared DTO (`src/_core/domain/dtos/`)**: transfer/carrier across layers. Not frozen. Mutable transients allowed (e.g. `RagPipeline` attaches `_distance` on `BaseChunkDTO`). Read-result containers that are intrinsically values AND never mutated (e.g. `CursorPage`, `VectorSearchResult`) stay in `value_objects/` as frozen VOs.
+- **Rule of thumb**: "Can I hand this to another layer and expect it to never change downstream?" — yes → VO (frozen). no → DTO.
+- Suffix `DTO` on class names signals carrier role (ADR 004). VOs keep their domain name without suffix.
+
+### API Schema (Interface DTO)
+- Location: `src/{domain}/interface/server/schemas/{domain}_schema.py`
+- Inherits `BaseRequest` / `BaseResponse`
+- Explicit field declarations
+- Intentionally excludes sensitive fields (Response)
+- When fields are identical, Request also serves as the layer DTO
+
+### Model (SQLAlchemy ORM)
+- Location: `src/{domain}/infrastructure/database/models/{domain}_model.py`
+- Must never leave the Repository layer
+- Conversion: `DTO → Model: Model(**dto.model_dump())`
+- Conversion: `Model → DTO: DTO.model_validate(model, from_attributes=True)`
+
+### DynamoModel
+- Location: `src/{domain}/infrastructure/dynamodb/models/{domain}_model.py`
+- Uses `DynamoModelMeta` + `__dynamo_meta__` for table schema declaration
+- Must never leave the Repository layer (same rule as ORM Model)
+
+### VectorModel
+- Location: `src/{domain}/infrastructure/vectors/models/{domain}_model.py`
+- Uses `VectorModelMeta` + `__vector_meta__` for index schema declaration
+- Must never leave the VectorStore layer (same rule as ORM Model/DynamoModel)
+- Conversion: `Entity → Model: _to_model()` (abstract, subclass implements)
+- Conversion: `API response → DTO: return_entity.model_validate(metadata)`
+
+### Admin Page Config (BaseAdminPage)
+- Config: `src/{domain}/interface/admin/configs/{domain}_admin_config.py`
+- Page: `src/{domain}/interface/admin/pages/{domain}_page.py`
+- Config-only declaration (no ui import); route handlers in separate page file
+- DI: _service_provider internal resolve (no @inject/Provide)
